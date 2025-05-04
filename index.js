@@ -609,8 +609,8 @@ app.post("/tDashboard-create-assignment", async (req, res) => {
         for (const reviewNo of reviewNoList) {
           await client.query(
             `INSERT INTO public.student_assignment_reviews 
-            (assignmentid, studentemail, review_number, obtained_marks, review_status,review_date)
-            VALUES ($1, $2, $3, NULL, 'Pending', NULL)`,
+            (assignmentid, studentemail, review_number, obtained_marks, review_status,review_date,completetion_status)
+            VALUES ($1, $2, $3, NULL, 'Pending', NULL, 'Not Completed')`,
             [assignmentId, student.email, reviewNo]
           );
         }
@@ -1350,11 +1350,209 @@ AND t.assignmentid = $2;
   console.log(values);
   try {
     const response = await pool.query(query, values);
-    res.json("removed!")
+    res.json("removed!");
   } catch (err) {
     console.error(err);
   }
 });
+
+app.post("/fetch-reviews", async (req, res) => {
+  const assId = req.body.assId;
+  const userEmail = req.body.userEmail;
+  console.log(assId);
+  const query = `
+ WITH user_team AS (
+    -- Get the team ID for the given user and assignment
+    SELECT 
+        tm.teamid
+    FROM 
+        teammembers tm
+    JOIN 
+        teams t ON tm.teamid = t.teamid
+    WHERE 
+        tm.studentemail = $1
+        AND t.assignmentid = $2
+),
+team_completion_status AS (
+    -- Check if any team member has completed each review
+    SELECT 
+        sar.review_number,
+        COALESCE(MAX(sar.completetion_status), 'Not Completed') AS team_completion_status
+    FROM 
+        student_assignment_reviews sar
+    JOIN 
+        teammembers tm ON sar.studentemail = tm.studentemail
+    JOIN 
+        user_team ut ON tm.teamid = ut.teamid
+    WHERE 
+        sar.assignmentid = $2
+    GROUP BY 
+        sar.review_number
+)
+
+SELECT 
+    arc.configid,
+    arc.assignmentid,
+    arc.review_number,
+    arc.total_marks,
+    arc.review_description,
+    a.title AS assignment_name,
+    COALESCE(tcs.team_completion_status, 'Not Completed') AS completion_status
+FROM 
+    assignment_review_configs arc
+JOIN 
+    assignments a ON arc.assignmentid = a.assignmentid
+LEFT JOIN 
+    team_completion_status tcs ON arc.review_number = tcs.review_number
+WHERE 
+    arc.assignmentid = 7
+ORDER BY 
+    arc.review_number;
+  `;
+  const values = [userEmail, assId];
+
+  try {
+    const response = await pool.query(query, values);
+    console.log(response.rows);
+    res.json(response.rows);
+  } catch (err) {
+    console.error(err);
+  }
+});
+
+app.post("/submited-for-review", async (req, res) => {
+  const { assId, userEmail, reviewId } = req.body;
+  console.log(assId, userEmail, reviewId);
+  const query = `
+  WITH user_team AS (
+    -- Find the team of the given user for the specific assignment
+    SELECT tm.teamid
+    FROM teammembers tm
+    JOIN teams t ON tm.teamid = t.teamid
+    WHERE tm.studentemail = $2
+    AND t.assignmentid = $1
+),
+team_members AS (
+    -- Find all team members in the user's team
+    SELECT tm.studentemail
+    FROM teammembers tm
+    JOIN user_team ut ON tm.teamid = ut.teamid
+)
+
+-- Update completion status for all team members
+UPDATE student_assignment_reviews
+SET completetion_status = 'Completed'
+WHERE assignmentid = $1
+AND studentemail IN (SELECT studentemail FROM team_members)
+AND review_number = (
+    SELECT review_number 
+    FROM assignment_review_configs 
+    WHERE configid = $3
+);
+  `;
+  const values = [assId, userEmail, reviewId];
+
+  try{
+    const response = await pool.query(query, values);
+    console.log(response.rows);
+    res.json(response.rows);
+  }catch(err){
+    console.error(err);
+  }
+});
+
+
+
+
+
+app.post("/is-submited-for-review",async(req,res)=>{
+  const {assId, userEmail} = req.body;
+  const query = 
+  `SELECT 
+    sar.completetion_status
+FROM 
+    student_assignment_reviews sar
+JOIN 
+    assignment_review_configs arc ON sar.assignmentid = arc.assignmentid 
+    AND sar.review_number = arc.review_number
+WHERE 
+    sar.assignmentid = $1
+    AND sar.studentemail = $2
+ORDER BY 
+    sar.review_number;
+  `
+const values = [assId, userEmail];
+console.log(values);
+  try{
+    const response = await pool.query(query, values);
+    console.log(response.rows);
+    res.json(response.rows);
+  }catch(err){
+    console.error(err);
+  }
+
+
+});
+
+
+
+app.post("/dashboard-data-progress", async (req, res) => {
+  const query = `
+  WITH team_info AS (
+    -- Get the team ID for the given student and assignment
+    SELECT t.teamid 
+    FROM teammembers tm
+    JOIN teams t ON tm.teamid = t.teamid
+    WHERE tm.studentemail = $1 
+    AND t.assignmentid = $2
+),
+team_members AS (
+    -- Get all team members for this team
+    SELECT tm.studentemail
+    FROM teammembers tm
+    JOIN team_info ti ON tm.teamid = ti.teamid
+),
+total_reviews AS (
+    -- Get total number of reviews configured for this assignment
+    SELECT COUNT(*) AS total_count
+    FROM assignment_review_configs
+    WHERE assignmentid = $2
+),
+completed_reviews AS (
+    -- Count reviews with completed status for any team member
+    SELECT COUNT(DISTINCT arc.review_number) AS completed_count
+    FROM assignment_review_configs arc
+    JOIN student_assignment_reviews sar ON 
+        arc.assignmentid = sar.assignmentid AND 
+        arc.review_number = sar.review_number
+    JOIN team_members tm ON sar.studentemail = tm.studentemail
+    WHERE arc.assignmentid = $2
+    AND sar.completetion_status = 'Completed'
+)
+-- Return all three values: reviews_done, reviews_total, and progress
+SELECT 
+    cr.completed_count AS reviews_done,
+    tr.total_count AS reviews_total,
+    COALESCE(
+        (cr.completed_count::numeric / NULLIF(tr.total_count, 0) * 100), 
+        0
+    ) AS progress
+FROM total_reviews tr
+CROSS JOIN completed_reviews cr;`
+
+const values = [req.body.userEmail, req.body.assId];
+try{
+  const response = await pool.query(query, values);
+  console.log(response.rows);
+  res.json(response.rows);
+}catch(err){
+  console.error(err);
+}
+});
+
+
+
+
 
 app.listen(PORT, () => {
   console.log(`Running at port ${PORT}`);

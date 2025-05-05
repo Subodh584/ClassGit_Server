@@ -1377,7 +1377,9 @@ team_completion_status AS (
     -- Check if any team member has completed each review
     SELECT 
         sar.review_number,
-        COALESCE(MAX(sar.completetion_status), 'Not Completed') AS team_completion_status
+        COALESCE(MAX(sar.completetion_status), 'Not Completed') AS team_completion_status,
+        -- Get the deadline for this review
+        MAX(sar.review_deadline) AS review_deadline
     FROM 
         student_assignment_reviews sar
     JOIN 
@@ -1397,7 +1399,8 @@ SELECT
     arc.total_marks,
     arc.review_description,
     a.title AS assignment_name,
-    COALESCE(tcs.team_completion_status, 'Not Completed') AS completion_status
+    COALESCE(tcs.team_completion_status, 'Not Completed') AS completion_status,
+    tcs.review_deadline
 FROM 
     assignment_review_configs arc
 JOIN 
@@ -1405,7 +1408,7 @@ JOIN
 LEFT JOIN 
     team_completion_status tcs ON arc.review_number = tcs.review_number
 WHERE 
-    arc.assignmentid = 7
+    arc.assignmentid = $2
 ORDER BY 
     arc.review_number;
   `;
@@ -1550,10 +1553,139 @@ try{
 }
 });
 
+app.post("/fetch-assignment-options",async(req,res)=>{
+  const query = `
+  WITH assignment_data AS (
+    SELECT 
+        a.assignmentid,
+        a.title,
+        a.duedate AS deadline
+    FROM 
+        assignments a
+    WHERE 
+        a.createdby = $1
+),
+review_data AS (
+    SELECT 
+        arc.assignmentid,
+        arc.configid AS id,
+        'Review ' || arc.review_number AS name,
+        arc.review_description,
+        arc.review_number,
+        MAX(sar.review_deadline) AS deadline,
+        CASE 
+            WHEN MAX(sar.review_deadline) IS NULL THEN FALSE
+            ELSE TRUE
+        END AS permitted
+    FROM 
+        assignment_review_configs arc
+    LEFT JOIN 
+        student_assignment_reviews sar ON arc.assignmentid = sar.assignmentid AND arc.review_number = sar.review_number
+    GROUP BY 
+        arc.assignmentid, arc.configid, arc.review_number, arc.review_description
+)
+SELECT 
+    ad.assignmentid AS id,
+    ad.title,
+    ad.deadline,
+    COALESCE(
+        json_agg(
+            json_build_object(
+                'id', rd.id,
+                'name', rd.name,
+                'deadline', rd.deadline,
+                'permitted', rd.permitted
+            )
+            ORDER BY rd.review_number
+        ) FILTER (WHERE rd.id IS NOT NULL),
+        '[]'::json
+    ) AS reviews
+FROM 
+    assignment_data ad
+LEFT JOIN 
+    review_data rd ON ad.assignmentid = rd.assignmentid
+GROUP BY 
+    ad.assignmentid, ad.title, ad.deadline
+ORDER BY 
+    ad.deadline;
+  `
+  const values = [req.body.userEmail];
+  try{
+    const response = await pool.query(query,values);
+    res.json(response.rows);
+  }catch(err){
+    console.error(err);
+  }
+});
 
-
-
-
+app.post("/save-review-settings", async (req, res) => {
+  try {
+    // We need to embed the parameters inside the query text
+    const query = `
+DO $$
+DECLARE
+    assignment_id INT := ${req.body.assId};
+    reviews_data JSON := '${JSON.stringify(req.body.reviews)}';
+    review_item JSON;
+    config_id INT;
+    deadline_text TEXT;
+    deadline_date DATE;
+    review_num INT;
+BEGIN
+    -- For each review in the array
+    FOR i IN 0..json_array_length(reviews_data)-1 LOOP
+        review_item := reviews_data->i;
+        config_id := (review_item->>'id')::INT;
+        deadline_text := review_item->>'deadline';
+        
+        -- Set deadline_date to NULL if deadline is not provided or empty
+        IF deadline_text IS NULL OR deadline_text = '' OR deadline_text = 'null' THEN
+            deadline_date := NULL;
+        ELSE
+            deadline_date := deadline_text::DATE;
+        END IF;
+        
+        -- Get the review_number from assignment_review_configs using the config_id
+        SELECT review_number INTO review_num
+        FROM assignment_review_configs
+        WHERE configid = config_id;
+        
+        IF review_num IS NOT NULL THEN
+            -- Update the review_deadline for all students with this assignment and review number
+            UPDATE student_assignment_reviews
+            SET review_deadline = deadline_date
+            WHERE assignmentid = assignment_id
+            AND review_number = review_num;
+        END IF;
+    END LOOP;
+    
+    -- Handle reviews that might be in the database but not in the provided data
+    -- Get all review numbers for this assignment
+    FOR review_num IN 
+        SELECT arc.review_number 
+        FROM assignment_review_configs arc
+        WHERE arc.assignmentid = assignment_id
+        AND arc.configid NOT IN (
+            SELECT (json_array_elements(reviews_data)->>'id')::INT
+        )
+    LOOP
+        -- Set review_deadline to NULL for reviews not included in the data
+        UPDATE student_assignment_reviews
+        SET review_deadline = NULL
+        WHERE assignmentid = assignment_id
+        AND review_number = review_num;
+    END LOOP;
+END $$;
+    `;
+    
+    // Execute without parameters
+    await pool.query(query);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Running at port ${PORT}`);
 });

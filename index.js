@@ -1686,6 +1686,271 @@ END $$;
     res.status(500).json({ error: err.message });
   }
 });
+
+
+
+app.post("/get-assignment-details",async (req,res)=>{
+  const query = 
+  `
+  SELECT 
+    a.assignmentid AS id,
+    a.title,
+    a.description AS desc,
+    s.sectionname AS section,
+    a.maxteammembers AS teamSize,
+    (
+        SELECT json_agg(
+            json_build_object(
+                'id', arc.review_number,
+                'name', 'Review ' || arc.review_number,
+                'marks', arc.total_marks,
+                'description', arc.review_description
+            )
+        )
+        FROM assignment_review_configs arc
+        WHERE arc.assignmentid = a.assignmentid
+    ) AS reviews
+FROM 
+    assignments a
+JOIN 
+    teacherssubjects ts ON a.subjectid = ts.subjectid
+JOIN 
+    assignmentssections ass ON a.assignmentid = ass.assignmentid
+JOIN 
+    sections s ON ass.sectionid = s.sectionid
+WHERE 
+    ts.teacheremail = $1
+ORDER BY 
+    a.duedate DESC;
+  `
+  const values = [req.body.userEmail];
+  try{
+    const response = await pool.query(query,values);
+    console.log(response.rows);
+    res.json(response.rows);
+  }catch(err){
+    console.error(err);
+  }
+});
+
+
+app.post("/update-edited-assignment", async (req, res) => {
+  try {
+    console.log("Received data:", req.body);
+    const editedAssignment = req.body.editedAssignment;
+    
+    // Basic validation
+    if (!editedAssignment) {
+      return res.status(400).json({
+        success: false,
+        message: "Request body is empty"
+      });
+    }
+    
+    // Check for required fields with detailed error messages
+    if (editedAssignment.id === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "Assignment ID is required"
+      });
+    }
+    
+    // Start a transaction
+    await pool.query('BEGIN');
+    
+    // Update the main assignment details
+    const updateAssignmentQuery = `
+      UPDATE assignments 
+      SET title = $1, 
+          description = $2, 
+          maxteammembers = $3
+      WHERE assignmentid = $4
+    `;
+    await pool.query(updateAssignmentQuery, [
+      editedAssignment.title || '',
+      editedAssignment.desc || '',
+      editedAssignment.teamsize || 1,
+      editedAssignment.id
+    ]);
+    
+    // Update section association
+    const deleteSectionQuery = `
+      DELETE FROM assignmentssections 
+      WHERE assignmentid = $1
+    `;
+    await pool.query(deleteSectionQuery, [editedAssignment.id]);
+    
+    // Only insert new section if specified
+    if (editedAssignment.section) {
+      const insertSectionQuery = `
+        INSERT INTO assignmentssections (assignmentid, sectionid)
+        SELECT $1, sectionid 
+        FROM sections 
+        WHERE sectionname = $2
+      `;
+      await pool.query(insertSectionQuery, [
+        editedAssignment.id, 
+        editedAssignment.section
+      ]);
+    }
+    
+    // Get existing review configurations
+    const existingReviewsResult = await pool.query(
+      `SELECT configid, review_number, total_marks, review_description FROM assignment_review_configs WHERE assignmentid = $1`,
+      [editedAssignment.id]
+    );
+    const existingReviews = existingReviewsResult.rows;
+    const existingReviewNumbers = existingReviews.map(row => row.review_number);
+    
+    // Get all student emails enrolled in this assignment
+    const studentEmailsResult = await pool.query(
+      `SELECT studentemail FROM studentsassignments WHERE assignmentid = $1`,
+      [editedAssignment.id]
+    );
+    const studentEmails = studentEmailsResult.rows.map(row => row.studentemail);
+    
+    // Process reviews if they exist
+    if (editedAssignment.reviews) {
+      // Try to parse reviews if it's a string
+      let reviewsArray = editedAssignment.reviews;
+      if (typeof reviewsArray === 'string') {
+        try {
+          reviewsArray = JSON.parse(reviewsArray);
+        } catch (e) {
+          console.error("Failed to parse reviews string:", e);
+          reviewsArray = [];
+        }
+      }
+      
+      // Ensure it's an array
+      if (Array.isArray(reviewsArray)) {
+        // Get the updated review numbers
+        const updatedReviewNumbers = reviewsArray
+          .filter(review => review && review.id !== undefined)
+          .map(review => review.id);
+          
+        // Find reviews that need to be deleted (exist in database but not in updated list)
+        const reviewsToDelete = existingReviewNumbers.filter(num => !updatedReviewNumbers.includes(num));
+        
+        // Delete student_assignment_reviews entries for reviews being deleted FIRST
+        if (reviewsToDelete.length > 0) {
+          // First delete entries from student_assignment_reviews
+          const deleteStudentReviewsQuery = `
+            DELETE FROM student_assignment_reviews 
+            WHERE assignmentid = $1 AND review_number = ANY($2::int[])
+          `;
+          await pool.query(deleteStudentReviewsQuery, [
+            editedAssignment.id, 
+            reviewsToDelete
+          ]);
+          
+          // Then delete the review configurations
+          const deleteObsoleteReviewsQuery = `
+            DELETE FROM assignment_review_configs 
+            WHERE assignmentid = $1 AND review_number = ANY($2::int[])
+          `;
+          await pool.query(deleteObsoleteReviewsQuery, [
+            editedAssignment.id, 
+            reviewsToDelete
+          ]);
+          
+          console.log(`Deleted reviews with numbers: ${reviewsToDelete.join(', ')}`);
+        }
+        
+        // Process each review in the updated list
+        for (const review of reviewsArray) {
+          if (review && review.id !== undefined) {
+            // Check if this review already exists
+            const existingReview = existingReviews.find(er => er.review_number === review.id);
+            
+            if (existingReview) {
+              // Update existing review if needed
+              if (existingReview.total_marks !== (review.marks || 0) || 
+                  existingReview.review_description !== (review.description || '')) {
+                
+                const updateReviewQuery = `
+                  UPDATE assignment_review_configs 
+                  SET total_marks = $1, review_description = $2
+                  WHERE configid = $3
+                `;
+                await pool.query(updateReviewQuery, [
+                  review.marks || 0,
+                  review.description || '',
+                  existingReview.configid
+                ]);
+              }
+            } else {
+              // This is a new review, insert it
+              const insertReviewQuery = `
+                INSERT INTO assignment_review_configs
+                (assignmentid, review_number, total_marks, review_description)
+                VALUES ($1, $2, $3, $4)
+              `;
+              await pool.query(insertReviewQuery, [
+                editedAssignment.id,
+                review.id,
+                review.marks || 0,
+                review.description || ''
+              ]);
+              
+              // Create student_assignment_reviews entries for all enrolled students
+              for (const studentEmail of studentEmails) {
+                const insertStudentReviewQuery = `
+                  INSERT INTO student_assignment_reviews
+                  (assignmentid, studentemail, review_number, review_status, review_date, completetion_status)
+                  VALUES ($1, $2, $3, $4, NULL, $5)
+                  ON CONFLICT (assignmentid, studentemail, review_number) DO NOTHING
+                `;
+                await pool.query(insertStudentReviewQuery, [
+                  editedAssignment.id,
+                  studentEmail,
+                  review.id,
+                  'Pending',
+                  'Not Completed'
+                ]);
+              }
+            }
+          }
+        }
+      } else {
+        console.warn("Reviews is not an array:", reviewsArray);
+      }
+    }
+    
+    // Commit the transaction
+    await pool.query('COMMIT');
+    
+    res.status(200).json({ 
+      success: true, 
+      message: "Assignment updated successfully" 
+    });
+    
+  } catch (error) {
+    // Rollback in case of error
+    await pool.query('ROLLBACK');
+    console.error("Error updating assignment:", error);
+    
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to update assignment",
+      error: error.message 
+    });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 app.listen(PORT, () => {
   console.log(`Running at port ${PORT}`);
 });
